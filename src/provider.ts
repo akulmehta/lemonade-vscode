@@ -9,7 +9,7 @@ import {
 	Progress,
 } from "vscode";
 
-import { convertTools, convertMessages, tryParseJSONObject, validateRequest } from "./utils";
+import { convertTools, convertMessages, isDataPart, tryParseJSONObject, validateRequest } from "./utils";
 import type { LemonadeEndpoint, LemonadeModel, LemonadeModelsResponse } from "./types";
 
 const DEFAULT_BASE_URL = "http://localhost:13305/api/v1";
@@ -17,6 +17,53 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 16000;
 const DEFAULT_CONTEXT_LENGTH = 128000;
 const DEFAULT_API_KEY = "lemonade";
 const ENDPOINTS_SECRET_KEY = "lemonade.endpoints";
+
+/**
+ * Determine if a model returned by the Lemonade HTTP API has vision/multimodal capabilities.
+ * Checks server-provided metadata, VS Code user settings, and model name patterns.
+ */
+function isVisionModel(model: LemonadeModel): boolean {
+	if (!model || typeof model !== "object") {
+		return false;
+	}
+	try {
+		const config = vscode.workspace.getConfiguration("lemonade");
+		if (config.get<boolean>("enableVisionForAll") === true) {
+			return true;
+		}
+		const customVisionList = config.get<string[]>("visionModels");
+		if (Array.isArray(customVisionList)) {
+			const id = String(model.id || "");
+			if (customVisionList.some((item) => typeof item === "string" && (item === id || id.toLowerCase().includes(item.toLowerCase())))) {
+				return true;
+			}
+		}
+	} catch {
+		// Outside VS Code
+	}
+
+	// 1. Check metadata returned directly over HTTP by Lemonade server
+	if (Array.isArray(model.labels) && model.labels.some((l) => typeof l === "string" && /vision|image|multimodal|vlm/i.test(l))) {
+		return true;
+	}
+	if (model.mmproj || (model.checkpoints && model.checkpoints.mmproj)) {
+		return true;
+	}
+	if (Array.isArray(model.modalities) && model.modalities.some((m) => typeof m === "string" && /image|vision/i.test(m))) {
+		return true;
+	}
+	if (model.capabilities && ((model.capabilities as Record<string, unknown>).vision || (model.capabilities as Record<string, unknown>).imageInput)) {
+		return true;
+	}
+	if (model.vision === true || model.imageInput === true) {
+		return true;
+	}
+
+	// 2. Name-based heuristics for vision/multimodal models
+	const modelId = String(model.id || "");
+	const visionPattern = /(?:^|[-_./])(?:vl|vision|vlm|visual|multimodal|omni|pixtral|paligemma|llava|internvl|minicpm[-_]?v|florence|cogvlm|idefics|molmo|ocr)(?:$|[-_./])|qwen.*-vl|gemma-.*-it/i;
+	return visionPattern.test(modelId);
+}
 
 /**
  * Resolve the context length to use. Reads LEMONADE_CTX_SIZE from the
@@ -76,13 +123,15 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	 */
 	constructor(private readonly secrets: vscode.SecretStorage, private readonly userAgent: string) {}
 
-	/** Roughly estimate tokens for VS Code chat messages (text only) */
+	/** Roughly estimate tokens for VS Code chat messages */
 	private estimateMessagesTokens(msgs: readonly vscode.LanguageModelChatMessage[]): number {
 		let total = 0;
 		for (const m of msgs) {
 			for (const part of m.content) {
 				if (part instanceof vscode.LanguageModelTextPart) {
 					total += Math.ceil(part.value.length / 4);
+				} else if (isDataPart(part) || (part as { data?: unknown }).data) {
+					total += 1000;
 				}
 			}
 		}
@@ -129,6 +178,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 		for (const { ep, models } of results) {
 			for (const model of models) {
 				const id = `${ep.shortname}/${model.id}`;
+				const isVision = isVisionModel(model);
 				infos.push({
 					id,
 					name: id,
@@ -139,7 +189,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 					maxOutputTokens: maxOutput,
 					capabilities: {
 						toolCalling: true,
-						imageInput: false,
+						imageInput: isVision,
 					},
 				} satisfies LanguageModelChatInformation);
 			}
@@ -381,6 +431,8 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			for (const part of text.content) {
 				if (part instanceof vscode.LanguageModelTextPart) {
 					totalTokens += Math.ceil(part.value.length / 4);
+				} else if (isDataPart(part) || (part as { data?: unknown }).data) {
+					totalTokens += 1000;
 				}
 			}
 			return totalTokens;
@@ -549,7 +601,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	 * This handles older-style control tokens like <tool_call> and <function=...
 	 */
 	private stripControlTokensWithBuffering(text: string): string {
-		let data = this._controlTokenBuffer + text;
+		const data = this._controlTokenBuffer + text;
 		let result = "";
 		let pos = 0;
 

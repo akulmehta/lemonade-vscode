@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
 import { LemonadeChatModelProvider } from "../provider";
-import { convertMessages, convertTools, validateRequest, validateTools, tryParseJSONObject } from "../utils";
+import { convertMessages, convertTools, dataPartToBase64, isDataPart, tryParseJSONObject, validateRequest, validateTools } from "../utils";
 import type { LemonadeEndpoint } from "../types";
 
 interface OpenAIToolCall {
@@ -271,6 +271,38 @@ suite("Lemonade Chat Provider Extension", () => {
 			assert.ok(out[0].content?.includes("after"));
 			assert.ok(Array.isArray(out[0].tool_calls) && out[0].tool_calls.length === 1);
 			assert.equal(out[0].tool_calls?.[0].function.name, "search");
+		});
+
+		test("handles multimodal image data parts in user messages", () => {
+			const fakeImageData = Buffer.from("fake-image-bytes");
+			const fakeDataPart = {
+				data: fakeImageData,
+				mimeType: "image/png",
+			};
+
+			assert.ok(isDataPart(fakeDataPart));
+			const base64 = dataPartToBase64(fakeDataPart);
+			assert.equal(base64, fakeImageData.toString("base64"));
+
+			const msg = {
+				role: vscode.LanguageModelChatMessageRole.User,
+				content: [
+					new vscode.LanguageModelTextPart("What is in this image?"),
+					fakeDataPart as unknown as vscode.LanguageModelTextPart,
+				],
+				name: undefined,
+			};
+
+			const out = convertMessages([msg]);
+			assert.equal(out.length, 1);
+			assert.equal(out[0].role, "user");
+			assert.ok(Array.isArray(out[0].content));
+			const contentParts = out[0].content as Array<{ type: string; text?: string; image_url?: { url: string } }>;
+			assert.equal(contentParts.length, 2);
+			assert.equal(contentParts[0].type, "text");
+			assert.equal(contentParts[0].text, "What is in this image?");
+			assert.equal(contentParts[1].type, "image_url");
+			assert.equal(contentParts[1].image_url?.url, `data:image/png;base64,${fakeImageData.toString("base64")}`);
 		});
 	});
 
