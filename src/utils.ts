@@ -1,5 +1,12 @@
 import * as vscode from "vscode";
-import type { OpenAIChatMessage, OpenAIChatRole, OpenAIFunctionToolDef, OpenAIToolCall } from "./types";
+import type {
+	OpenAIChatMessage,
+	OpenAIChatRole,
+	OpenAIFunctionToolDef,
+	OpenAIImageContentPart,
+	OpenAIMessageContentPart,
+	OpenAIToolCall,
+} from "./types";
 
 // Tool calling sanitization helpers
 
@@ -136,6 +143,47 @@ function sanitizeSchema(input: unknown, propName?: string): Record<string, unkno
 }
 
 /**
+ * Check if a part is a LanguageModelDataPart (e.g. image).
+ */
+export function isDataPart(part: unknown): part is { data: Uint8Array | Buffer | number[] | string; mimeType?: string; mime?: string } {
+	if (!part || typeof part !== "object") {
+		return false;
+	}
+	const vsAny = vscode as unknown as Record<string, unknown>;
+	const DataPartCtor = vsAny["LanguageModelDataPart"] as (new (...args: unknown[]) => unknown) | undefined;
+	if (DataPartCtor && part instanceof DataPartCtor) {
+		return true;
+	}
+	return Boolean((part as { data?: unknown }).data && ((part as { mimeType?: unknown }).mimeType || (part as { mime?: unknown }).mime));
+}
+
+/**
+ * Convert data part bytes to base64 string.
+ */
+export function dataPartToBase64(part: { data?: unknown }): string {
+	try {
+		if (!part || !part.data) {
+			return "";
+		}
+		if (Buffer.isBuffer(part.data)) {
+			return part.data.toString("base64");
+		}
+		if (part.data instanceof Uint8Array) {
+			return Buffer.from(part.data.buffer, part.data.byteOffset, part.data.byteLength).toString("base64");
+		}
+		if (Array.isArray(part.data)) {
+			return Buffer.from(part.data).toString("base64");
+		}
+		if (typeof part.data === "string") {
+			return part.data;
+		}
+		return Buffer.from(part.data as ArrayBuffer).toString("base64");
+	} catch {
+		return "";
+	}
+}
+
+/**
  * Convert VS Code chat request messages into OpenAI-compatible message objects.
  * @param messages The VS Code chat messages to convert.
  * @param filterEphemeral Whether to filter out ephemeral data sentinels.
@@ -143,18 +191,30 @@ function sanitizeSchema(input: unknown, propName?: string): Record<string, unkno
  */
 export function convertMessages(
 	messages: readonly vscode.LanguageModelChatRequestMessage[],
-	filterEphemeral: boolean = true
+	filterEphemeral = true
 ): OpenAIChatMessage[] {
 	const out: OpenAIChatMessage[] = [];
 	for (const m of messages) {
 		const role = mapRole(m);
 		const textParts: string[] = [];
+		const imageParts: OpenAIImageContentPart[] = [];
 		const toolCalls: OpenAIToolCall[] = [];
 		const toolResults: { callId: string; content: string }[] = [];
 
 		for (const part of m.content ?? []) {
 			if (part instanceof vscode.LanguageModelTextPart) {
 				textParts.push(part.value);
+			} else if (isDataPart(part)) {
+				const mime = (part as { mimeType?: string; mime?: string }).mimeType || (part as { mimeType?: string; mime?: string }).mime || "image/png";
+				const base64 = dataPartToBase64(part);
+				if (base64) {
+					imageParts.push({
+						type: "image_url",
+						image_url: {
+							url: `data:${mime};base64,${base64}`,
+						},
+					});
+				}
 			} else if (part instanceof vscode.LanguageModelToolCallPart) {
 				const id = part.callId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 				let args = "{}";
@@ -181,9 +241,19 @@ export function convertMessages(
 			out.push({ role: "tool", tool_call_id: tr.callId, content: tr.content || "" });
 		}
 
-		const text = textParts.join("");
-		if (text && (role === "system" || role === "user" || (role === "assistant" && !emittedAssistantToolCall))) {
-			out.push({ role, content: text });
+		if (imageParts.length > 0) {
+			const content: OpenAIMessageContentPart[] = [];
+			const text = textParts.join("");
+			if (text) {
+				content.push({ type: "text", text });
+			}
+			content.push(...imageParts);
+			out.push({ role, content });
+		} else {
+			const text = textParts.join("");
+			if (text && (role === "system" || role === "user" || (role === "assistant" && !emittedAssistantToolCall))) {
+				out.push({ role, content: text });
+			}
 		}
 	}
 	return out;
@@ -331,7 +401,7 @@ function mapRole(message: vscode.LanguageModelChatRequestMessage): Exclude<OpenA
  */
 function collectToolResultText(
 	pr: { content?: ReadonlyArray<unknown> },
-	filterEphemeral: boolean = true
+	filterEphemeral = true
 ): string {
 	let text = "";
 	for (const c of pr.content ?? []) {

@@ -40,21 +40,25 @@ The extension connects to `http://localhost:13305/api/v1` by default. You can ch
 |---|---|---|
 | `LEMONADE_CTX_SIZE` | `262144` | Context window size (in tokens) reported to VS Code. Set this to match the `--ctx-size` value used when starting Lemonade so the model picker displays the correct context limits. For example, `LEMONADE_CTX_SIZE=262144` for a 256 k context window. |
 
-### VS Code settings
+### VS Code Settings
 
 Configure the provider in VS Code's `settings.json`:
 
 ```json
 {
     "lemonade.maxOutputTokens": 65536,
-    "lemonade.requestTimeout": 900000
+    "lemonade.requestTimeout": 900000,
+    "lemonade.enableVisionForAll": false,
+    "lemonade.visionModels": ["qwen-vl", "gemma-it"]
 }
 ```
 
-| Setting | Default | Range | Description |
-|---|---:|---:|---|
-| `lemonade.maxOutputTokens` | `65536` | 1 to 262144 | Maximum response tokens advertised to VS Code and requested from Lemonade unless the host supplies a lower `max_tokens` value. Reserve sufficient context for the prompt and tool definitions. |
-| `lemonade.requestTimeout` | `300000` ms | 10000 to 3600000 ms | Total extension-to-Lemonade request timeout, including prompt processing and the complete streamed response. Increase it for long prompts or generations. |
+| Setting | Default | Description |
+|---|---|---|
+| `lemonade.maxOutputTokens` | `65536` | Maximum response tokens advertised to VS Code and requested from Lemonade (1 to 262144). |
+| `lemonade.requestTimeout` | `300000` ms | Total extension-to-Lemonade request timeout in milliseconds (10000 to 3600000 ms). |
+| `lemonade.enableVisionForAll` | `false` | Force-enable vision/image support for all models from the Lemonade server. |
+| `lemonade.visionModels` | `[]` | List of model IDs or substring names to explicitly enable vision/image support for. |
 
 `lemonade.requestTimeout` controls the VS Code extension only. Lemonade server timeouts, backend queueing, and reverse-proxy timeouts are configured independently. The extension logs whether a request was cancelled by VS Code or by its configured timeout in the Extension Host log.
 

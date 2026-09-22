@@ -54,7 +54,39 @@
 				"command": "lemonade.toggleEphemeralFilter",
 				"title": "Toggle Lemonade filter ephemeral data"
 			}
-		]
+		],
+		"configuration": {
+			"title": "Lemonade",
+			"properties": {
+				"lemonade.maxOutputTokens": {
+					"type": "integer",
+					"default": 65536,
+					"minimum": 1,
+					"maximum": 262144,
+					"description": "Maximum response tokens requested from Lemonade."
+				},
+				"lemonade.requestTimeout": {
+					"type": "integer",
+					"default": 300000,
+					"minimum": 10000,
+					"maximum": 3600000,
+					"description": "Total extension-to-Lemonade request timeout in milliseconds."
+				},
+				"lemonade.enableVisionForAll": {
+					"type": "boolean",
+					"default": false,
+					"description": "Force-enable vision/image support for all models from the Lemonade server."
+				},
+				"lemonade.visionModels": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [],
+					"description": "List of model IDs or substring names to explicitly enable vision/image support for."
+				}
+			}
+		}
 	},
 	"main": "./out/extension.js",
 	"scripts": {
