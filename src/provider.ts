@@ -586,9 +586,9 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 		// report thinking progress if backend provides it and host supports it
 		// Backend may use either 'thinking' (standard) or 'reasoning_content' (llama.cpp deepseek)
 		try {
-			const maybeThinking = (choice as Record<string, unknown> | undefined)?.thinking 
-				?? (deltaObj as Record<string, unknown> | undefined)?.thinking 
-				?? (choice as Record<string, unknown> | undefined)?.reasoning_content 
+			const maybeThinking = (choice as Record<string, unknown> | undefined)?.thinking
+				?? (deltaObj as Record<string, unknown> | undefined)?.thinking
+				?? (choice as Record<string, unknown> | undefined)?.reasoning_content
 				?? (deltaObj as Record<string, unknown> | undefined)?.reasoning_content;
 			if (maybeThinking !== undefined) {
 				const vsAny = (vscode as unknown as Record<string, unknown>);

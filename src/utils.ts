@@ -226,8 +226,14 @@ export function convertMessages(
 				toolCalls.push({ id, type: "function", function: { name: part.name, arguments: args } });
 			} else if (isToolResultPart(part)) {
 				const callId = (part as { callId?: string }).callId ?? "";
-				const content = collectToolResultText(part as { content?: ReadonlyArray<unknown> }, filterEphemeral);
+				const { text: content, images: toolImages } = collectToolResultContent(
+					part as { content?: ReadonlyArray<unknown> },
+					filterEphemeral
+				);
 				toolResults.push({ callId, content });
+				if (toolImages.length > 0) {
+					imageParts.push(...toolImages);
+				}
 			}
 		}
 
@@ -395,20 +401,36 @@ function mapRole(message: vscode.LanguageModelChatRequestMessage): Exclude<OpenA
 }
 
 /**
- * Concatenate tool result content into a single text string.
+ * Process tool result content into a text string and extracted image parts.
+ * When tools return binary image data (e.g. browser screenshots), extract them
+ * as proper OpenAI image parts for the user turn rather than serializing megabytes of raw bytes.
  * @param pr Tool result-like object with content array.
  * @param filterEphemeral Whether to filter out ephemeral data sentinels.
  */
-function collectToolResultText(
+function collectToolResultContent(
 	pr: { content?: ReadonlyArray<unknown> },
 	filterEphemeral = true
-): string {
+): { text: string; images: OpenAIImageContentPart[] } {
 	let text = "";
+	const images: OpenAIImageContentPart[] = [];
+
 	for (const c of pr.content ?? []) {
 		if (c instanceof vscode.LanguageModelTextPart) {
 			text += c.value;
 		} else if (typeof c === "string") {
 			text += c;
+		} else if (isDataPart(c)) {
+			const mime = (c as { mimeType?: string; mime?: string }).mimeType || (c as { mimeType?: string; mime?: string }).mime || "image/png";
+			const base64 = dataPartToBase64(c);
+			if (base64) {
+				images.push({
+					type: "image_url",
+					image_url: {
+						url: `data:${mime};base64,${base64}`,
+					},
+				});
+				text += `[Image screenshot captured: ${mime}]`;
+			}
 		} else {
 			// Check for cache_control sentinel (VS Code 1.118+ internal sentinel)
 			const isObj = !!c && typeof c === "object";
@@ -434,7 +456,7 @@ function collectToolResultText(
 			}
 		}
 	}
-	return text;
+	return { text, images };
 }
 
 /**
