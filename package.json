@@ -8,9 +8,9 @@
 		"type": "git",
 		"url": "https://github.com/lemonade-sdk/lemonade-vscode"
 	},
-	"version": "0.0.8",
+	"version": "0.0.10",
 	"engines": {
-		"vscode": "^1.104.0"
+		"vscode": "^1.109.0"
 	},
 	"categories": [
 		"AI",
@@ -37,9 +37,55 @@
 			{
 				"vendor": "lemonade",
 				"displayName": "Lemonade",
-				"managementCommand": "lemonade.manage"
+				"icon": "assets/provider-icon.png",
+				"configuration": {
+					"type": "object",
+					"properties": {
+						"url": {
+							"type": "string",
+							"title": "Server URL",
+							"description": "Lemonade server URL, e.g. http://localhost:13305/api/v1",
+							"default": "http://localhost:13305/api/v1"
+						},
+						"apiKey": {
+							"type": "string",
+							"title": "API Key",
+							"description": "Optional API key. Leave empty to use the default.",
+							"secret": true
+						},
+						"models": {
+							"type": "array",
+							"title": "Models",
+							"description": "Optional model ids to show from this server. Leave empty to show all models.",
+							"items": { "type": "string" }
+						}
+					},
+					"required": ["url"]
+				}
 			}
 		],
+		"configuration": {
+			"title": "Lemonade",
+			"properties": {
+				"lemonade.reasoningEffort": {
+					"type": "string",
+					"enum": ["", "none", "low", "medium", "high"],
+					"default": "",
+					"markdownDescription": "Reasoning effort sent to the server as `reasoning_effort`. Leave empty to use the server default. Overridden by the model picker when the `chatProvider` API is available."
+				},
+				"lemonade.reasoningEfforts": {
+					"type": "object",
+					"default": {
+						"*": ["none", "low", "medium", "high"]
+					},
+					"additionalProperties": {
+						"type": "array",
+						"items": { "type": "string" }
+					},
+					"markdownDescription": "Reasoning effort levels shown in the model picker. Keys are case-insensitive substrings of the model id (e.g. `\"gpt-oss\": [\"low\", \"medium\", \"high\"]`); `\"*\"` applies to all models labelled `reasoning`. An empty array hides the picker for matching models."
+				}
+			}
+		},
 		"commands": [
 			{
 				"command": "lemonade.manage",

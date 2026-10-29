@@ -212,7 +212,154 @@ suite("Lemonade Chat Provider Extension", () => {
 				);
 				assert.equal(infos.length, 1);
 				assert.equal(infos[0].id, "node-17/Llama-3.2-3B");
-				assert.equal(infos[0].name, "node-17/Llama-3.2-3B");
+				assert.equal(infos[0].name, "Llama-3.2-3B");
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		});
+
+		test("prepareLanguageModelChatInformation derives token budgets from recipe ctx_size", async () => {
+			const endpoints: LemonadeEndpoint[] = [
+				{ shortname: "node", url: "http://localhost:13305/api/v1" },
+			];
+			const originalFetch = global.fetch;
+			const originalCtx = process.env["LEMONADE_CTX_SIZE"];
+			try {
+				delete process.env["LEMONADE_CTX_SIZE"];
+				(global as unknown as Record<string, unknown>).fetch = async () => ({
+					ok: true,
+					json: async () => ({
+						object: "list",
+						data: [
+							{ id: "big", object: "model", recipe_options: { ctx_size: 200000 } },
+							{ id: "small", object: "model", recipe_options: { ctx_size: 32768 } },
+							{ id: "invalid", object: "model", recipe_options: { ctx_size: 0 } },
+							{ id: "none", object: "model" },
+						],
+					}),
+				});
+
+				const provider = new LemonadeChatModelProvider({
+					get: async (k: string) => k === "lemonade.endpoints" ? JSON.stringify(endpoints) : undefined,
+					store: async () => {},
+					delete: async () => {},
+					onDidChange: (_listener: unknown) => ({ dispose() {} }),
+				} as unknown as vscode.SecretStorage, "test/test");
+
+				const infos = await provider.prepareLanguageModelChatInformation(
+					{ silent: true },
+					new vscode.CancellationTokenSource().token
+				);
+				const byId = Object.fromEntries(infos.map((i) => [i.id, i]));
+
+				assert.equal(byId["node/big"].maxOutputTokens, 16000);
+				assert.equal(byId["node/big"].maxInputTokens, 184000);
+
+				assert.equal(byId["node/small"].maxOutputTokens, 16000);
+				assert.equal(byId["node/small"].maxInputTokens, 16768);
+
+				for (const id of ["node/invalid", "node/none"]) {
+					assert.equal(byId[id].maxOutputTokens, 16000);
+					assert.equal(byId[id].maxInputTokens, 112000);
+				}
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+				if (originalCtx === undefined) {
+					delete process.env["LEMONADE_CTX_SIZE"];
+				} else {
+					process.env["LEMONADE_CTX_SIZE"] = originalCtx;
+				}
+			}
+		});
+
+		test("prepareLanguageModelChatInformation keeps input capacity for an auto-tuned small context", async () => {
+			const originalFetch = global.fetch;
+			const endpoints: LemonadeEndpoint[] = [
+				{ shortname: "node", url: "http://localhost:13305/api/v1" },
+			];
+			try {
+				(global as unknown as Record<string, unknown>).fetch = async (url: string) => ({
+					ok: true,
+					json: async () => {
+						if (url.endsWith("/models")) {
+							return { data: [{ id: "auto", object: "model", recipe_options: { ctx_size: -1 }, context_length: 262144 }] };
+						}
+						if (url.endsWith("/health")) {
+							return { all_models_loaded: [] };
+						}
+						if (url.endsWith("/models/auto/options")) {
+							return { resolved_ctx_size: 8192 };
+						}
+						throw new Error(`Unexpected URL ${url}`);
+					},
+				});
+				const provider = new LemonadeChatModelProvider({
+					get: async (k: string) => k === "lemonade.endpoints" ? JSON.stringify(endpoints) : undefined,
+					store: async () => {},
+					delete: async () => {},
+					onDidChange: (_listener: unknown) => ({ dispose() {} }),
+				} as unknown as vscode.SecretStorage, "test/test");
+				const infos = await provider.prepareLanguageModelChatInformation(
+					{ silent: true }, new vscode.CancellationTokenSource().token
+				);
+				assert.equal(infos.length, 1);
+				assert.equal(infos[0].maxInputTokens, 4096);
+				assert.equal(infos[0].maxOutputTokens, 4096);
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		});
+
+		test("provideLanguageModelChatResponse reports reasoning_content as thinking", async function () {
+			const ThinkingPart = (vscode as unknown as Record<string, unknown>)["LanguageModelThinkingPart"] as
+				| (new (...args: unknown[]) => object)
+				| undefined;
+			if (!ThinkingPart) {
+				this.skip();
+			}
+
+			const originalFetch = global.fetch;
+			try {
+				const encoder = new TextEncoder();
+				(global as unknown as Record<string, unknown>).fetch = async () => ({
+					ok: true,
+					body: new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"pondering\"}}]}\n\n"));
+							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n"));
+							controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+							controller.close();
+						},
+					}),
+				});
+
+				const provider = new LemonadeChatModelProvider({
+					get: async () => undefined,
+					store: async () => {},
+					delete: async () => {},
+					onDidChange: (_listener: unknown) => ({ dispose() {} }),
+				} as unknown as vscode.SecretStorage, "test/test");
+
+				const parts: unknown[] = [];
+				await provider.provideLanguageModelChatResponse(
+					{
+						id: "m",
+						name: "m",
+						family: "lemonade",
+						version: "1.0.0",
+						maxInputTokens: 1000,
+						maxOutputTokens: 1000,
+						capabilities: {},
+					} as unknown as vscode.LanguageModelChatInformation,
+					[{ role: vscode.LanguageModelChatMessageRole.User, content: [new vscode.LanguageModelTextPart("hi")], name: undefined }],
+					{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+					{ report: (p) => parts.push(p) },
+					new vscode.CancellationTokenSource().token
+				);
+
+				assert.ok(parts[0] instanceof ThinkingPart!, "reasoning_content should be reported as a thinking part");
+				assert.ok(parts[1] instanceof vscode.LanguageModelTextPart);
+				assert.equal((parts[1] as vscode.LanguageModelTextPart).value, "answer");
 			} finally {
 				(global as unknown as Record<string, unknown>).fetch = originalFetch;
 			}
