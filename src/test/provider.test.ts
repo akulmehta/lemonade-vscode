@@ -1,8 +1,8 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { LemonadeChatModelProvider } from "../provider";
-import { convertMessages, convertTools, dataPartToBase64, isDataPart, tryParseJSONObject, validateRequest, validateTools } from "../utils";
-import type { LemonadeEndpoint } from "../types";
+import { LemonadeChatModelProvider, isVisionModel } from "../provider";
+import { convertMessages, convertTools, dataPartToBase64, isDataPart, isImageDataPart, tryParseJSONObject, validateRequest, validateTools } from "../utils";
+import type { LemonadeEndpoint, LemonadeModel } from "../types";
 
 interface OpenAIToolCall {
 	id: string;
@@ -303,6 +303,85 @@ suite("Lemonade Chat Provider Extension", () => {
 			assert.equal(contentParts[0].text, "What is in this image?");
 			assert.equal(contentParts[1].type, "image_url");
 			assert.equal(contentParts[1].image_url?.url, `data:image/png;base64,${fakeImageData.toString("base64")}`);
+		});
+
+		test("skips cache_control and non-image data parts in convertMessages", () => {
+			const cacheControlPart = {
+				data: Buffer.from("cache"),
+				mimeType: "cache_control",
+			};
+			const textDataPart = {
+				data: Buffer.from("some text"),
+				mimeType: "text/plain",
+			};
+			const untypedDataPart = {
+				data: Buffer.from("raw data"),
+			};
+
+			assert.ok(!isImageDataPart(cacheControlPart));
+			assert.ok(!isImageDataPart(textDataPart));
+			assert.ok(!isImageDataPart(untypedDataPart));
+
+			const msg = {
+				role: vscode.LanguageModelChatMessageRole.User,
+				content: [
+					new vscode.LanguageModelTextPart("Hello"),
+					cacheControlPart as unknown as vscode.LanguageModelTextPart,
+					textDataPart as unknown as vscode.LanguageModelTextPart,
+					untypedDataPart as unknown as vscode.LanguageModelTextPart,
+				],
+				name: undefined,
+			};
+
+			const out = convertMessages([msg], true);
+			assert.equal(out.length, 1);
+			assert.equal(out[0].role, "user");
+			assert.equal(typeof out[0].content, "string");
+			assert.equal(out[0].content, "Hello");
+		});
+
+		test("never attaches image_url to assistant or system messages", () => {
+			const fakeImageData = Buffer.from("fake-image-bytes");
+			const fakeImagePart = {
+				data: fakeImageData,
+				mimeType: "image/png",
+			};
+
+			const assistantMsg = {
+				role: vscode.LanguageModelChatMessageRole.Assistant,
+				content: [
+					new vscode.LanguageModelTextPart("Assistant response"),
+					fakeImagePart as unknown as vscode.LanguageModelTextPart,
+				],
+				name: undefined,
+			};
+			const systemMsg = {
+				role: vscode.LanguageModelChatMessageRole.User - 999, // maps to system
+				content: [
+					new vscode.LanguageModelTextPart("System prompt"),
+					fakeImagePart as unknown as vscode.LanguageModelTextPart,
+				],
+				name: undefined,
+			};
+
+			const out = convertMessages([assistantMsg, systemMsg]);
+			for (const m of out) {
+				assert.ok(m.role !== "user");
+				assert.equal(typeof m.content, "string");
+			}
+		});
+
+		test("isVisionModel detects unambiguous vision models and ignores generic instruct models", () => {
+			assert.ok(isVisionModel({ id: "qwen2.5-vl-7b-instruct" } as unknown as LemonadeModel));
+			assert.ok(isVisionModel({ id: "llava-v1.6-34b" } as unknown as LemonadeModel));
+			assert.ok(isVisionModel({ id: "pixtral-12b" } as unknown as LemonadeModel));
+			assert.ok(isVisionModel({ id: "some-model", labels: ["vision"] } as unknown as LemonadeModel));
+			assert.ok(isVisionModel({ id: "custom", mmproj: "mmproj.gguf" } as unknown as LemonadeModel));
+
+			// Verify gemma instruct model is NOT matched by name heuristic
+			assert.ok(!isVisionModel({ id: "gemma-2-9b-it" } as unknown as LemonadeModel));
+			assert.ok(!isVisionModel({ id: "gemma-2-27b-it" } as unknown as LemonadeModel));
+			assert.ok(!isVisionModel({ id: "llama-3.1-8b-instruct" } as unknown as LemonadeModel));
 		});
 	});
 

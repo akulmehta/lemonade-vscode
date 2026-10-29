@@ -158,6 +158,17 @@ export function isDataPart(part: unknown): part is { data: Uint8Array | Buffer |
 }
 
 /**
+ * Check if a part is an image LanguageModelDataPart.
+ */
+export function isImageDataPart(part: unknown): part is { data: Uint8Array | Buffer | number[] | string; mimeType: string } {
+	if (!isDataPart(part)) {
+		return false;
+	}
+	const mime = (part as { mimeType?: string; mime?: string }).mimeType || (part as { mimeType?: string; mime?: string }).mime;
+	return typeof mime === "string" && mime.toLowerCase().startsWith("image/");
+}
+
+/**
  * Convert data part bytes to base64 string.
  */
 export function dataPartToBase64(part: { data?: unknown }): string {
@@ -205,15 +216,20 @@ export function convertMessages(
 			if (part instanceof vscode.LanguageModelTextPart) {
 				textParts.push(part.value);
 			} else if (isDataPart(part)) {
-				const mime = (part as { mimeType?: string; mime?: string }).mimeType || (part as { mimeType?: string; mime?: string }).mime || "image/png";
-				const base64 = dataPartToBase64(part);
-				if (base64) {
-					imageParts.push({
-						type: "image_url",
-						image_url: {
-							url: `data:${mime};base64,${base64}`,
-						},
-					});
+				const mime = (part as { mimeType?: string; mime?: string }).mimeType || (part as { mimeType?: string; mime?: string }).mime;
+				if (filterEphemeral && mime === "cache_control") {
+					continue;
+				}
+				if (typeof mime === "string" && mime.toLowerCase().startsWith("image/")) {
+					const base64 = dataPartToBase64(part);
+					if (base64) {
+						imageParts.push({
+							type: "image_url",
+							image_url: {
+								url: `data:${mime};base64,${base64}`,
+							},
+						});
+					}
 				}
 			} else if (part instanceof vscode.LanguageModelToolCallPart) {
 				const id = part.callId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -247,14 +263,14 @@ export function convertMessages(
 			out.push({ role: "tool", tool_call_id: tr.callId, content: tr.content || "" });
 		}
 
-		if (imageParts.length > 0) {
+		if (role === "user" && imageParts.length > 0) {
 			const content: OpenAIMessageContentPart[] = [];
 			const text = textParts.join("");
 			if (text) {
 				content.push({ type: "text", text });
 			}
 			content.push(...imageParts);
-			out.push({ role, content });
+			out.push({ role: "user", content });
 		} else {
 			const text = textParts.join("");
 			if (text && (role === "system" || role === "user" || (role === "assistant" && !emittedAssistantToolCall))) {
