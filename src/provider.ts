@@ -9,7 +9,7 @@ import {
 	Progress,
 } from "vscode";
 
-import { convertTools, convertMessages, isDataPart, tryParseJSONObject, validateRequest } from "./utils";
+import { convertTools, convertMessages, isDataPart, isImageDataPart, tryParseJSONObject, validateRequest } from "./utils";
 import type { LemonadeEndpoint, LemonadeModel, LemonadeModelsResponse } from "./types";
 
 const DEFAULT_BASE_URL = "http://localhost:13305/api/v1";
@@ -22,7 +22,7 @@ const ENDPOINTS_SECRET_KEY = "lemonade.endpoints";
  * Determine if a model returned by the Lemonade HTTP API has vision/multimodal capabilities.
  * Checks server-provided metadata, VS Code user settings, and model name patterns.
  */
-function isVisionModel(model: LemonadeModel): boolean {
+export function isVisionModel(model: LemonadeModel | undefined): boolean {
 	if (!model || typeof model !== "object") {
 		return false;
 	}
@@ -59,9 +59,9 @@ function isVisionModel(model: LemonadeModel): boolean {
 		return true;
 	}
 
-	// 2. Name-based heuristics for vision/multimodal models
+	// 2. Unambiguous name-based heuristics for vision models (e.g. llava, -vl, pixtral)
 	const modelId = String(model.id || "");
-	const visionPattern = /(?:^|[-_./])(?:vl|vision|vlm|visual|multimodal|omni|pixtral|paligemma|llava|internvl|minicpm[-_]?v|florence|cogvlm|idefics|molmo|ocr)(?:$|[-_./])|qwen.*-vl|gemma-.*-it/i;
+	const visionPattern = /(?:^|[-_./])(?:vl|pixtral|llava)(?:$|[-_./])|qwen.*-vl/i;
 	return visionPattern.test(modelId);
 }
 
@@ -130,8 +130,14 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			for (const part of m.content) {
 				if (part instanceof vscode.LanguageModelTextPart) {
 					total += Math.ceil(part.value.length / 4);
-				} else if (isDataPart(part) || (part as { data?: unknown }).data) {
+				} else if (isImageDataPart(part)) {
 					total += 1000;
+				} else if (isDataPart(part)) {
+					const mime = (part as { mimeType?: string; mime?: string }).mimeType || (part as { mimeType?: string; mime?: string }).mime;
+					if (mime !== "cache_control") {
+						const len = typeof part.data === "string" ? part.data.length : (part.data ? (part.data as { length?: number }).length ?? 0 : 0);
+						total += Math.ceil(len / 4);
+					}
 				}
 			}
 		}
@@ -431,8 +437,14 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			for (const part of text.content) {
 				if (part instanceof vscode.LanguageModelTextPart) {
 					totalTokens += Math.ceil(part.value.length / 4);
-				} else if (isDataPart(part) || (part as { data?: unknown }).data) {
+				} else if (isImageDataPart(part)) {
 					totalTokens += 1000;
+				} else if (isDataPart(part)) {
+					const mime = (part as { mimeType?: string; mime?: string }).mimeType || (part as { mimeType?: string; mime?: string }).mime;
+					if (mime !== "cache_control") {
+						const len = typeof part.data === "string" ? part.data.length : (part.data ? (part.data as { length?: number }).length ?? 0 : 0);
+						totalTokens += Math.ceil(len / 4);
+					}
 				}
 			}
 			return totalTokens;
