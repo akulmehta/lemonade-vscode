@@ -9,11 +9,12 @@ Lemonade allows you to use local LLMs on GitHub Copilot Chat!
     * We recommend setting the context size to at least 32k by using the Lemonade tray or --ctx-size cli option.
 1. Install the [Lemonade for GitHub Copilot](https://marketplace.visualstudio.com/items?itemName=lemonade-sdk.lemonade-sdk) extension
 1. Open VS Code's chat interface, click the model picker, and click "Manage Models..."
-1. Select "Lemonade" provider and choose a model (Qwen3-Coder-30B is a great start!)
+1. Select "Lemonade" provider, confirm the server URL (defaults to `http://localhost:13305/api/v1`) and optional API key in the form
+1. Choose a model (Qwen3-Coder-30B is a great start!)
 
 You can now start chatting with your local LLM models! 🥳
 
-> NOTE: If needed, configure a custom server URL using the "Manage Lemonade Provider" command
+> NOTE: Models appear only after a server has been added through the form above. Add one entry per Lemonade server to use several.
 
 ## 🌟 Why Choose Lemonade for Copilot?
 * **🔒 Complete Privacy**: Your code never leaves your machine. Everything stays local and secure
@@ -23,7 +24,7 @@ You can now start chatting with your local LLM models! 🥳
 * **🛠️ Advanced Tool Support**: Full function calling capabilities for complex tasks
 
 ## Requirements
-* VS Code 1.104.0 or higher
+* VS Code 1.109.0 or higher
 * Lemonade server 8.1.10 or higher
 
 
@@ -34,11 +35,30 @@ The extension connects to `http://localhost:13305/api/v1` by default. You can ch
 3. Entering your custom Lemonade server URL
 4. Optionally, entering your API key (if your server has `LEMONADE_API_KEY` configured)
 
+### Limiting visible models
+The optional `models` setting restricts the model picker to the listed model ids. Leave it unset or empty to show all models. Names the server does not return are ignored, and matching is exact.
+
+List the ids your server provides:
+```bash
+curl -s http://localhost:13305/api/v1/models
+```
+
+If the server form does not show a **Models** field, add it to the Lemonade entry in `chatLanguageModels.json` (open it from the Command Palette with **Chat: Manage Language Models**, or find it in your VS Code user data folder), then reload the window:
+```json
+{
+	"name": "Lemonade",
+	"vendor": "lemonade",
+	"url": "http://localhost:13305/api/v1",
+	"models": ["Qwen3-Coder-30B-A3B-Instruct-GGUF", "Qwen3.5-2B-GGUF-Q8_0"]
+}
+```
+Remove `models` to show every model again. This applies to servers added through the provider form, not through the older `lemonade.manage` command.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `LEMONADE_CTX_SIZE` | `262144` | Context window size (in tokens) reported to VS Code. Set this to match the `--ctx-size` value used when starting Lemonade so the model picker displays the correct context limits. For example, `LEMONADE_CTX_SIZE=262144` for a 256 k context window. |
+| `LEMONADE_CTX_SIZE` | `128000` | Fallback context window (in tokens) for older Lemonade servers or models whose effective context cannot be resolved. Current servers use per-model context settings and runtime/auto-tuned sizes when available. |
 
 ### VS Code Settings
 
@@ -49,7 +69,7 @@ Configure the provider in VS Code's `settings.json`:
     "lemonade.maxOutputTokens": 65536,
     "lemonade.requestTimeout": 900000,
     "lemonade.enableVisionForAll": false,
-    "lemonade.visionModels": ["qwen-vl", "gemma-it"]
+    "lemonade.visionModels": ["qwen-vl", "llava"]
 }
 ```
 
@@ -58,11 +78,11 @@ Configure the provider in VS Code's `settings.json`:
 | `lemonade.maxOutputTokens` | `65536` | Maximum response tokens advertised to VS Code and requested from Lemonade (1 to 262144). |
 | `lemonade.requestTimeout` | `300000` ms | Total extension-to-Lemonade request timeout in milliseconds (10000 to 3600000 ms). |
 | `lemonade.enableVisionForAll` | `false` | Force-enable vision/image support for all models from the Lemonade server. |
-| `lemonade.visionModels` | `[]` | List of model IDs or substring names to explicitly enable vision/image support for. |
+| `lemonade.visionModels` | `[]` | List of model IDs or substring names to explicitly enable vision/image support for (e.g. `["qwen-vl", "llava"]`). |
 
 `lemonade.requestTimeout` controls the VS Code extension only. Lemonade server timeouts, backend queueing, and reverse-proxy timeouts are configured independently. The extension logs whether a request was cancelled by VS Code or by its configured timeout in the Extension Host log.
 
-> **Tip:** Launch VS Code from a terminal where `LEMONADE_CTX_SIZE` is already set, or add it to your system/user environment variables so it is always picked up.
+> **Tip:** For older servers, launch VS Code with `LEMONADE_CTX_SIZE` set to the actual context limit. Current Lemonade servers normally determine this per model automatically.
 
 ## Support & License
 * Open issues: https://github.com/lemonade-sdk/lemonade/issues

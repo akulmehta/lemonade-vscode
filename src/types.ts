@@ -50,7 +50,6 @@ export interface OpenAIChatMessage {
 	tool_call_id?: string;
 }
 
-
 /**
  * Buffer used to accumulate streamed tool call parts until arguments are valid JSON.
  */
@@ -67,6 +66,7 @@ export interface LemonadeEndpoint {
 	shortname: string;  // e.g. "node-17"
 	url: string;        // e.g. "http://192.168.1.17:8000/api/v1"
 	apiKey?: string;    // per-endpoint key; falls back to DEFAULT_API_KEY when absent
+	models?: string[];  // optional allow-list of server model ids; all models when absent or empty
 }
 
 /**
@@ -77,6 +77,11 @@ export interface LemonadeModel {
 	object: string;
 	created?: number;
 	owned_by?: string;
+	recipe?: string;
+	context_length?: number;
+	recipe_options?: {
+		ctx_size?: number;
+	};
 	labels?: string[];
 	mmproj?: string;
 	modalities?: string[];

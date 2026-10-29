@@ -9,32 +9,51 @@ import {
 	Progress,
 } from "vscode";
 
-import { convertTools, convertMessages, isDataPart, isImageDataPart, tryParseJSONObject, validateRequest } from "./utils";
+import { convertTools, convertMessages, filterModels, isDataPart, isImageDataPart, validateRequest } from "./utils";
+import { ChatStreamParser } from "./streamParser";
 import type { LemonadeEndpoint, LemonadeModel, LemonadeModelsResponse } from "./types";
+import { resolveModelContextLengths } from "./modelContext";
 
 const DEFAULT_BASE_URL = "http://localhost:13305/api/v1";
-const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
-const DEFAULT_CONTEXT_LENGTH = 262144;
+const DEFAULT_MAX_OUTPUT_TOKENS = 16000;
+const DEFAULT_CONTEXT_LENGTH = 128000;
 const DEFAULT_API_KEY = "lemonade";
-const DEFAULT_REQUEST_TIMEOUT = 300000;
 const ENDPOINTS_SECRET_KEY = "lemonade.endpoints";
 
+const REASONING_LEVEL_LABELS: Record<string, string> = {
+	none: "None",
+	low: "Low",
+	medium: "Medium",
+	high: "High",
+};
+
 /**
- * Resolve the max output tokens to use. Reads from VS Code setting
- * `lemonade.maxOutputTokens`; falls back to DEFAULT_MAX_OUTPUT_TOKENS when
- * the setting is absent, not a positive integer, or when running outside VS Code.
+ * Resolve supported reasoning effort levels for a model. The `lemonade.reasoningEfforts`
+ * setting maps a case-insensitive substring of the model id to its levels; "*" is the
+ * fallback and only applies to models labelled "reasoning". An empty list disables the picker.
  */
-async function resolveMaxOutputTokens(): Promise<number> {
-	try {
-		const config = vscode.workspace.getConfiguration("lemonade");
-		const raw = config.get<number>("maxOutputTokens");
-		if (raw !== undefined && Number.isFinite(raw) && raw > 0) {
-			return raw;
-		}
-	} catch {
-		// Running outside VS Code (e.g., tests) — fall through to default
-	}
-	return DEFAULT_MAX_OUTPUT_TOKENS;
+function resolveReasoningLevels(modelId: string, labels: string[] | undefined): string[] | undefined {
+	const map = vscode.workspace.getConfiguration("lemonade").get<Record<string, string[]>>("reasoningEfforts") ?? {};
+	const id = modelId.toLowerCase();
+	const key = Object.keys(map).find((k) => k !== "*" && id.includes(k.toLowerCase()));
+	const levels = key !== undefined ? map[key] : labels?.includes("reasoning") ? map["*"] : undefined;
+	return Array.isArray(levels) && levels.length > 0 ? levels : undefined;
+}
+
+function buildConfigurationSchema(levels: string[]) {
+	return {
+		properties: {
+			reasoningEffort: {
+				type: "string",
+				title: "Reasoning",
+				description: "Reasoning effort sent to the Lemonade server as reasoning_effort.",
+				enum: levels,
+				enumItemLabels: levels.map((l) => REASONING_LEVEL_LABELS[l] ?? l),
+				default: levels.includes("medium") ? "medium" : levels[0],
+				group: "navigation",
+			},
+		},
+	};
 }
 
 /**
@@ -100,55 +119,21 @@ function resolveContextLength(): number {
 	return DEFAULT_CONTEXT_LENGTH;
 }
 
-/** Resolve the maximum time allowed for an HTTP request, including streaming. */
-function resolveRequestTimeout(): number {
-	try {
-		const raw = vscode.workspace.getConfiguration("lemonade").get<number>("requestTimeout");
-		if (raw !== undefined && Number.isFinite(raw) && raw > 0) {
-			return raw;
-		}
-	} catch {
-		// Running outside VS Code (e.g., tests) — use the default.
-	}
-	return DEFAULT_REQUEST_TIMEOUT;
-}
-
 /**
  * VS Code Chat provider backed by Lemonade local LLM server.
  */
 export class LemonadeChatModelProvider implements LanguageModelChatProvider {
+	private readonly _onDidChange = new vscode.EventEmitter<void>();
+	readonly onDidChangeLanguageModelChatInformation = this._onDidChange.event;
+
+	/** Ask VS Code to re-query the model list (e.g. after settings change). */
+	refresh(): void {
+		this._onDidChange.fire();
+	}
+
 	private _chatEndpoints: { model: string; modelMaxPromptTokens: number }[] = [];
-	/** Buffer for assembling streamed tool calls by index. */
-	private _toolCallBuffers: Map<number, { id?: string; name?: string; args: string }> = new Map<
-		number,
-		{ id?: string; name?: string; args: string }
-	>();
-
-	/** Indices for which a tool call has been fully emitted. */
-	private _completedToolCallIndices = new Set<number>();
-
-	/** Track if we emitted any assistant text before seeing tool calls (SSE-like begin-tool-calls hint). */
-	private _hasEmittedAssistantText = false;
-
-	/** Track if we emitted the begin-tool-calls whitespace flush. */
-	private _emittedBeginToolCallsHint = false;
-
-	// Lightweight tokenizer state for tool calls embedded in text
-	private _textToolParserBuffer = "";
-	private _textToolActive:
-		| undefined
-		| {
-			name?: string;
-			index?: number;
-			argBuffer: string;
-			emitted?: boolean;
-		};
-	private _emittedTextToolCallKeys = new Set<string>();
-	private _emittedTextToolCallIds = new Set<string>();
-
-	/** Buffer for handling control tokens that might be split across streaming chunks. */
-	private _controlTokenBuffer = "";
-
+	/** Endpoint each model info object was built from; chat receives the same object back. */
+	private _endpointByModel = new WeakMap<LanguageModelChatInformation, { endpoint: LemonadeEndpoint; modelId: string }>();
 	/**
 	 * Create a provider using the given secret storage for the server URL.
 	 * @param secrets VS Code secret storage.
@@ -193,33 +178,54 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	 * endpoints are swallowed so healthy nodes still appear.
 	 */
 	async prepareLanguageModelChatInformation(
-		options: { silent: boolean },
+		options: { silent: boolean; group?: string; configuration?: Readonly<Record<string, unknown>> },
 		_token: CancellationToken
 	): Promise<LanguageModelChatInformation[]> {
-		const endpoints = await this.getEndpoints();
-		const maxOutput = await resolveMaxOutputTokens();
-		const maxInput = Math.max(1, resolveContextLength() - maxOutput);
+		const groupEndpoint = this.endpointFromConfiguration(options.group, options.configuration);
+		const endpoints = groupEndpoint ? [groupEndpoint] : await this.getEndpoints({ includeDefault: false });
+		const fallbackContextLength = resolveContextLength();
 
 		// Fetch models from all endpoints concurrently; ignore per-endpoint errors
 		const results = await Promise.all(
 			endpoints.map(async (ep) => {
 				try {
-					const models = await this.fetchModels(ep);
-					return { ep, models };
+					const models = filterModels(await this.fetchModels(ep), ep.models);
+					const contextSignal = AbortSignal.timeout(2500);
+					const contextLengths = await resolveModelContextLengths(
+						models, fallbackContextLength, async (path) => {
+							const response = await fetch(`${ep.url}${path}`, {
+								method: "GET",
+								headers: {
+									Authorization: `Bearer ${ep.apiKey || DEFAULT_API_KEY}`,
+									"User-Agent": this.userAgent,
+								},
+								signal: contextSignal,
+							});
+							return response.ok ? response.json() : undefined;
+						}
+					);
+					return { ep, models, contextLengths };
 				} catch {
-					return { ep, models: [] as LemonadeModel[] };
+					return { ep, models: [] as LemonadeModel[], contextLengths: [] as number[] };
 				}
 			})
 		);
 
 		const infos: LanguageModelChatInformation[] = [];
-		for (const { ep, models } of results) {
-			for (const model of models) {
-				const id = `${ep.shortname}/${model.id}`;
+		for (const { ep, models, contextLengths } of results) {
+			for (const [index, model] of models.entries()) {
+				// Group-configured endpoints are resolved via _endpointByModel, so the raw id is used.
+				const id = groupEndpoint ? model.id : `${ep.shortname}/${model.id}`;
+				const contextLength = contextLengths[index];
+				// Preserve a usable input budget even when auto-tuning selects a small context.
+				const maxOutput = Math.min(DEFAULT_MAX_OUTPUT_TOKENS, Math.max(1, Math.floor(contextLength / 2)));
+				const maxInput = Math.max(1, contextLength - maxOutput);
+				const levels = resolveReasoningLevels(model.id, model.labels);
 				const isVision = isVisionModel(model);
-				infos.push({
+				const info = {
 					id,
-					name: id,
+					// Only disambiguate with the endpoint name when several endpoints are listed together.
+					name: results.length > 1 ? id : model.id,
 					tooltip: `Lemonade node: ${ep.url}`,
 					family: "lemonade",
 					version: "1.0.0",
@@ -229,7 +235,11 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 						toolCalling: true,
 						imageInput: isVision,
 					},
-				} satisfies LanguageModelChatInformation);
+					// Proposed API (chatProvider): renders a reasoning picker in the model menu.
+					...(levels ? { configurationSchema: buildConfigurationSchema(levels) } : {}),
+				} satisfies LanguageModelChatInformation;
+				this._endpointByModel.set(info, { endpoint: ep, modelId: model.id });
+				infos.push(info);
 			}
 		}
 
@@ -248,10 +258,29 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	}
 
 	async provideLanguageModelChatInformation(
-		options: { silent: boolean },
+		options: { silent: boolean; group?: string; configuration?: Readonly<Record<string, unknown>> },
 		_token: CancellationToken
 	): Promise<LanguageModelChatInformation[]> {
-		return this.prepareLanguageModelChatInformation({ silent: options.silent ?? false }, _token);
+		return this.prepareLanguageModelChatInformation({ ...options, silent: options.silent ?? false }, _token);
+	}
+
+	/** Build an endpoint from a provider group's configuration (declared in package.json). */
+	private endpointFromConfiguration(
+		group: string | undefined,
+		configuration: Readonly<Record<string, unknown>> | undefined
+	): LemonadeEndpoint | undefined {
+		const url = typeof configuration?.url === "string" ? configuration.url.trim().replace(/\/+$/, "") : "";
+		if (!url) { return undefined; }
+		const apiKey = typeof configuration?.apiKey === "string" ? configuration.apiKey.trim() : "";
+		const models = Array.isArray(configuration?.models)
+			? configuration.models.filter((m): m is string => typeof m === "string" && m.trim().length > 0).map((m) => m.trim())
+			: [];
+		return {
+			shortname: group ?? "default",
+			url,
+			...(apiKey ? { apiKey } : {}),
+			...(models.length > 0 ? { models } : {}),
+		};
 	}
 
 	/**
@@ -259,7 +288,8 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	 * endpoint when nothing has been configured yet, and migrates legacy
 	 * single-URL secrets on first access.
 	 */
-	async getEndpoints(): Promise<LemonadeEndpoint[]> {
+	async getEndpoints(options: { includeDefault?: boolean } = {}): Promise<LemonadeEndpoint[]> {
+		const includeDefault = options.includeDefault ?? true;
 		// Migration: promote legacy single-URL secrets to the new format
 		const legacyUrl = await this.secrets.get("lemonade.serverUrl");
 		if (legacyUrl) {
@@ -287,7 +317,8 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			}
 		}
 
-		// No config yet — return built-in default so extension works out of the box
+		// Listing skips the built-in default: it would duplicate a localhost server added through the form
+		if (!includeDefault) { return []; }
 		return [{ shortname: "default", url: DEFAULT_BASE_URL }];
 	}
 
@@ -296,28 +327,21 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	 */
 	private async fetchModels(endpoint: LemonadeEndpoint): Promise<LemonadeModel[]> {
 		const apiKey = endpoint.apiKey || DEFAULT_API_KEY;
-		const controller = new AbortController();
-		const timeoutId = setTimeout(() => controller.abort(), resolveRequestTimeout());
 
-		try {
-			const response = await fetch(`${endpoint.url}/models`, {
-				method: "GET",
-				headers: {
-					Authorization: `Bearer ${apiKey}`,
-					"User-Agent": this.userAgent,
-				},
-				signal: controller.signal,
-			});
+		const response = await fetch(`${endpoint.url}/models`, {
+			method: "GET",
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				"User-Agent": this.userAgent,
+			},
+		});
 
-			if (!response.ok) {
-				throw new Error(`[Lemonade] Failed to fetch models from ${endpoint.shortname}: ${response.status} ${response.statusText}`);
-				}
-
-			const data = (await response.json()) as LemonadeModelsResponse;
-			return data.data || [];
-		} finally {
-			clearTimeout(timeoutId);
+		if (!response.ok) {
+			throw new Error(`[Lemonade] Failed to fetch models from ${endpoint.shortname}: ${response.status} ${response.statusText}`);
 		}
+
+		const data = (await response.json()) as LemonadeModelsResponse;
+		return data.data || [];
 	}
 
 	/**
@@ -337,20 +361,18 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 		progress: Progress<LanguageModelResponsePart>,
 		token: CancellationToken
 	): Promise<void> {
+		if (token.isCancellationRequested) {
+			return;
+		}
 
-		this._toolCallBuffers.clear();
-		this._completedToolCallIndices.clear();
-		this._hasEmittedAssistantText = false;
-		this._emittedBeginToolCallsHint = false;
-        this._textToolParserBuffer = "";
-        this._textToolActive = undefined;
-        this._emittedTextToolCallKeys.clear();
-        this._emittedTextToolCallIds.clear();
-		this._controlTokenBuffer = "";
-
+		const abortController = new AbortController();
+		const cancellation = token.onCancellationRequested(() => abortController.abort());
 		let requestBody: Record<string, unknown> | undefined;
 		const trackingProgress: Progress<LanguageModelResponsePart> = {
 			report: (part) => {
+				if (token.isCancellationRequested) {
+					return;
+				}
 				try {
 					progress.report(part);
 				} catch (e) {
@@ -362,13 +384,15 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			},
 		};
 		try {
-			// Decode "<shortname>/<modelId>" from the model id
-			const slashIdx = model.id.indexOf("/");
+			const mapped = this._endpointByModel.get(model);
+			// Fall back to decoding "<shortname>/<modelId>" when the info object is unknown
+			const slashIdx = mapped ? -1 : model.id.indexOf("/");
 			const shortname = slashIdx >= 0 ? model.id.slice(0, slashIdx) : "default";
-			const realModelId = slashIdx >= 0 ? model.id.slice(slashIdx + 1) : model.id;
+			const realModelId = mapped?.modelId ?? (slashIdx >= 0 ? model.id.slice(slashIdx + 1) : model.id);
 
 			const endpoints = await this.getEndpoints();
-			const endpoint = endpoints.find(ep => ep.shortname === shortname)
+			const endpoint = mapped?.endpoint
+				?? endpoints.find(ep => ep.shortname === shortname)
 				?? endpoints[0]
 				?? { shortname: "default", url: DEFAULT_BASE_URL };
 
@@ -397,12 +421,11 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
                 throw new Error("Message exceeds token limit.");
             }
 
-            const maxOutputTokens = await resolveMaxOutputTokens();
             requestBody = {
                 model: realModelId,
                 messages: openaiMessages,
                 stream: true,
-                max_tokens: Math.min(options.modelOptions?.max_tokens ?? maxOutputTokens, model.maxOutputTokens),
+                max_tokens: Math.min(options.modelOptions?.max_tokens || 4096, model.maxOutputTokens),
                 temperature: options.modelOptions?.temperature ?? 0.7,
             };
 
@@ -420,62 +443,62 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 				}
 			}
 
+			const modelConfiguration = (options as { modelConfiguration?: Record<string, unknown> }).modelConfiguration;
+			const pickerEffort = modelConfiguration?.reasoningEffort;
+			const settingEffort = vscode.workspace.getConfiguration("lemonade").get<string>("reasoningEffort");
+			const effort = typeof pickerEffort === "string" && pickerEffort ? pickerEffort : settingEffort;
+			if (typeof effort === "string" && effort) {
+				(requestBody as Record<string, unknown>).reasoning_effort = effort;
+				// Per-request kwargs take precedence over server-level --chat-template-kwargs.
+				(requestBody as Record<string, unknown>).chat_template_kwargs = { reasoning_effort: effort };
+			}
+
 			if (toolConfig.tools) {
 				(requestBody as Record<string, unknown>).tools = toolConfig.tools;
 			}
 			if (toolConfig.tool_choice) {
 				(requestBody as Record<string, unknown>).tool_choice = toolConfig.tool_choice;
 			}
-			const controller = new AbortController();
-			    const requestTimeout = resolveRequestTimeout();
-			    const timeoutId = setTimeout(() => {
-				    console.error("[Lemonade Model Provider] HTTP request timeout", {
-					    modelId: model.id,
-					    timeoutMs: requestTimeout,
-				    });
-				    controller.abort();
-			    }, requestTimeout);
-			    const cancellationSubscription = token.onCancellationRequested(() => {
-				    console.error("[Lemonade Model Provider] VS Code cancelled HTTP request", {
-					    modelId: model.id,
-				    });
-				    controller.abort();
-			    });
-			try {
-				const response = await fetch(`${baseUrl}/chat/completions`, {
-					method: "POST",
-					headers: {
-						Authorization: `Bearer ${apiKey}`,
-						"Content-Type": "application/json",
-						"User-Agent": this.userAgent,
-					},
-					body: JSON.stringify(requestBody),
-					signal: controller.signal,
-				});
-
-				if (!response.ok) {
-					const errorText = await response.text();
-					console.error("[Lemonade Model Provider] API error response", errorText);
-					throw new Error(
-						`Lemonade API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
-					);
-				}
-
-				if (!response.body) {
-					throw new Error("No response body from Lemonade API");
-				}
-				await this.processStreamingResponse(response.body, trackingProgress, token);
-			} finally {
-				cancellationSubscription.dispose();
-				clearTimeout(timeoutId);
+			if (token.isCancellationRequested) {
+				return;
 			}
+			const response = await fetch(`${baseUrl}/chat/completions`, {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${apiKey}`,
+                    "Content-Type": "application/json",
+					"User-Agent": this.userAgent,
+                },
+                body: JSON.stringify(requestBody),
+				signal: abortController.signal,
+            });
+
+			if (!response.ok) {
+				const errorText = await response.text();
+				console.error("[Lemonade Model Provider] API error response", errorText);
+				throw new Error(
+					`Lemonade API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
+				);
+			}
+
+			if (!response.body) {
+				throw new Error("No response body from Lemonade API");
+			}
+			await new ChatStreamParser().processStreamingResponse(response.body, trackingProgress, token);
 		} catch (err) {
+			if (token.isCancellationRequested && abortController.signal.aborted) {
+				return;
+			}
 			console.error("[Lemonade Model Provider] Chat request failed", {
 				modelId: model.id,
 				messageCount: messages.length,
 				error: err instanceof Error ? { name: err.name, message: err.message } : String(err),
 			});
 			throw err;
+		} finally {
+			cancellation.dispose();
+			// Also close an unread response body if processing ended early.
+			abortController.abort();
 		}
 	}
 
@@ -511,499 +534,6 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			return totalTokens;
 		}
 	}
-
-	/**
-	 * Read and parse the Lemonade server streaming (SSE-like) response and report parts.
-	 * @param responseBody The readable stream body.
-	 * @param progress Progress reporter for streamed parts.
-	 * @param token Cancellation token.
-	 */
-    private async processStreamingResponse(
-        responseBody: ReadableStream<Uint8Array>,
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        token: vscode.CancellationToken,
-    ): Promise<void> {
-        const reader = responseBody.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-		try {
-			while (!token.isCancellationRequested) {
-				const { done, value } = await reader.read();
-                if (done) { break; }
-
-				buffer += decoder.decode(value, { stream: true });
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-
-				for (const line of lines) {
-					if (!line.startsWith("data: ")) {
-						continue;
-					}
-					const data = line.slice(6);
-                    if (data === "[DONE]") {
-                        // Do not throw on [DONE]; any incomplete/empty buffers are ignored.
-                        await this.flushToolCallBuffers(progress, /*throwOnInvalid*/ false);
-                        // Flush any in-progress text-embedded tool call (silent if incomplete)
-                        await this.flushActiveTextToolCall(progress);
-                        continue;
-                    }
-
-					try {
-						const parsed = JSON.parse(data);
-						const error = parsed.error as Record<string, unknown> | undefined;
-						if (error && typeof error.message === "string") {
-							throw new Error(`Lemonade streaming error: ${error.message}`);
-						}
-                        await this.processDelta(parsed, progress);
-					} catch (error) {
-						if (error instanceof SyntaxError) {
-							// Ignore malformed SSE lines until the server finishes the stream.
-							continue;
-						}
-						throw error;
-                    }
-                }
-            }
-        } finally {
-            reader.releaseLock();
-            // Clean up any leftover tool call state
-            this._toolCallBuffers.clear();
-            this._completedToolCallIndices.clear();
-            this._hasEmittedAssistantText = false;
-            this._emittedBeginToolCallsHint = false;
-            this._textToolParserBuffer = "";
-            this._textToolActive = undefined;
-            this._emittedTextToolCallKeys.clear();
-			this._emittedTextToolCallIds.clear();
-			this._controlTokenBuffer = "";
-        }
-    }
-
-	/**
-	 * Handle a single streamed delta chunk, emitting text and tool call parts.
-	 * @param delta Parsed SSE chunk from the Router.
-	 * @param progress Progress reporter for parts.
-	 */
-    private async processDelta(
-        delta: Record<string, unknown>,
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-    ): Promise<boolean> {
-        let emitted = false;
-        const choice = (delta.choices as Record<string, unknown>[] | undefined)?.[0];
-        if (!choice) { return false; }
-
-		const deltaObj = choice.delta as Record<string, unknown> | undefined;
-
-		// report thinking progress if backend provides it and host supports it
-		// Backend may use either 'thinking' (standard) or 'reasoning_content' (llama.cpp deepseek)
-		try {
-			const maybeThinking = (choice as Record<string, unknown> | undefined)?.thinking
-				?? (deltaObj as Record<string, unknown> | undefined)?.thinking
-				?? (choice as Record<string, unknown> | undefined)?.reasoning_content
-				?? (deltaObj as Record<string, unknown> | undefined)?.reasoning_content;
-			if (maybeThinking !== undefined) {
-				const vsAny = (vscode as unknown as Record<string, unknown>);
-				const ThinkingCtor = vsAny["LanguageModelThinkingPart"] as
-					| (new (text: string, id?: string, metadata?: unknown) => unknown)
-					| undefined;
-                    if (ThinkingCtor) {
-                        let text = "";
-                        let id: string | undefined;
-                        let metadata: unknown;
-                        if (maybeThinking && typeof maybeThinking === "object") {
-                            const mt = maybeThinking as Record<string, unknown>;
-                            text = typeof mt["text"] === "string" ? (mt["text"] as string) : "";
-                            id = typeof mt["id"] === "string" ? (mt["id"] as string) : undefined;
-                            metadata = mt["metadata"];
-                        } else if (typeof maybeThinking === "string") {
-                            text = maybeThinking;
-                        }
-                        if (text) {
-                            progress.report(new (ThinkingCtor as new (text: string, id?: string, metadata?: unknown) => unknown)(text, id, metadata) as unknown as vscode.LanguageModelResponsePart);
-                            emitted = true;
-                        }
-                    }
-                }
-            } catch {
-                // ignore errors here temporarily
-            }
-            if (deltaObj?.content) {
-                const content = String(deltaObj.content);
-                const res = this.processTextContent(content, progress);
-                if (res.emittedText) {
-                    this._hasEmittedAssistantText = true;
-                }
-                if (res.emittedAny) {
-                    emitted = true;
-                }
-            }
-
-			if (deltaObj?.tool_calls) {
-                const toolCalls = deltaObj.tool_calls as Array<Record<string, unknown>>;
-
-				// SSEProcessor-like: if first tool call appears after text, emit a whitespace
-				// to ensure any UI buffers/linkifiers are flushed without adding visible noise.
-				if (!this._emittedBeginToolCallsHint && this._hasEmittedAssistantText && toolCalls.length > 0) {
-					progress.report(new vscode.LanguageModelTextPart(" "));
-					this._emittedBeginToolCallsHint = true;
-				}
-
-				for (const tc of toolCalls) {
-					const idx = (tc.index as number) ?? 0;
-					// Ignore any further deltas for an index we've already completed
-					if (this._completedToolCallIndices.has(idx)) {
-						continue;
-					}
-					const buf = this._toolCallBuffers.get(idx) ?? { args: "" };
-					if (tc.id && typeof tc.id === "string") {
-						buf.id = tc.id as string;
-					}
-					const func = tc.function as Record<string, unknown> | undefined;
-					if (func?.name && typeof func.name === "string") {
-						buf.name = func.name as string;
-					}
-					if (typeof func?.arguments === "string") {
-						buf.args += func.arguments as string;
-					}
-					this._toolCallBuffers.set(idx, buf);
-
-					// Emit immediately once arguments become valid JSON to avoid perceived hanging
-                    await this.tryEmitBufferedToolCall(idx, progress);
-                }
-            }
-
-        const finish = (choice.finish_reason as string | undefined) ?? undefined;
-        if (finish === "tool_calls" || finish === "stop") {
-            // On both 'tool_calls' and 'stop', emit any buffered calls and throw on invalid JSON
-            await this.flushToolCallBuffers(progress, /*throwOnInvalid*/ true);
-        }
-        return emitted;
-    }
-
-	/**
-	 * Strip control tokens with buffering to handle tokens split across chunks.
-	 * This handles older-style control tokens like <tool_call> and <function=...
-	 */
-	private stripControlTokensWithBuffering(text: string): string {
-		const data = this._controlTokenBuffer + text;
-		let result = "";
-		let pos = 0;
-
-		while (pos < data.length) {
-			let foundMatch = false;
-
-			// Check for complete control token patterns
-			const controlPatterns = [
-				/<tool_call>/g,
-				/<\/function>/g,
-				/<\|tool_calls_section_(?:begin|end)\|>/g,
-				/<\|tool_call_(?:argument_)?(?:begin|end)\|>/g,
-				/<function=[a-zA-Z0-9_\-.]+>/g  // Match complete function tags
-			];
-
-			// Try to match any control pattern at current position
-			for (const pattern of controlPatterns) {
-				pattern.lastIndex = 0; // Reset regex state
-				const remaining = data.slice(pos);
-				const match = pattern.exec(remaining);
-
-				if (match && match.index === 0) {
-					// Found a complete token at current position, skip it
-					pos += match[0].length;
-					foundMatch = true;
-					break;
-				}
-			}
-
-			if (!foundMatch) {
-				// Check for potential incomplete control tokens near end of chunk
-				let isPartialToken = false;
-				if (pos >= data.length - 50) { // Check last 50 chars for partial tokens
-					const remaining = data.slice(pos);
-
-					// Check for partial patterns that could complete in next chunk
-					const partialPatterns = [
-						/^<tool_cal?$/,
-						/^<tool_call?$/,
-						/^<\|tool_calls?$/,
-						/^<\|tool_calls_section?$/,
-						/^<\|tool_calls_section_(?:begin|end)?$/,
-						/^<\|tool_call?$/,
-						/^<\|tool_call_(?:argument_)?$/,
-						/^<\|tool_call_(?:argument_)?(?:begin|end)?$/,
-						/^<function?$/,
-						/^<function=?$/,
-						/^<function=[a-zA-Z0-9_\-.]*$/,  // Partial function name
-						/^<\/function?$/
-					];
-
-					for (const pattern of partialPatterns) {
-						if (pattern.test(remaining)) {
-							isPartialToken = true;
-							break;
-						}
-					}
-				}
-
-				if (isPartialToken) {
-					// Keep remaining text in buffer for next chunk
-					this._controlTokenBuffer = data.slice(pos);
-					break;
-				} else {
-					// Safe to emit this character
-					result += data[pos];
-					pos++;
-				}
-			}
-		}
-
-		// If we consumed everything, clear the buffer
-		if (pos >= data.length) {
-			this._controlTokenBuffer = "";
-		}
-
-		return result;
-	}
-
-    /**
-     * Process streamed text content for inline tool-call control tokens and emit text/tool calls.
-     * Returns which parts were emitted for logging/flow control.
-     */
-    private processTextContent(
-        input: string,
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-    ): { emittedText: boolean; emittedAny: boolean } {
-        const BEGIN = "<|tool_call_begin|>";
-        const ARG_BEGIN = "<|tool_call_argument_begin|>";
-        const END = "<|tool_call_end|>";
-
-        let data = this._textToolParserBuffer + input;
-        let emittedText = false;
-        let emittedAny = false;
-        let visibleOut = "";
-
-        while (data.length > 0) {
-            if (!this._textToolActive) {
-                const b = data.indexOf(BEGIN);
-                if (b === -1) {
-                    // No tool-call start: emit visible portion, but keep any partial BEGIN prefix as buffer
-                    const longestPartialPrefix = ((): number => {
-                        for (let k = Math.min(BEGIN.length - 1, data.length - 1); k > 0; k--) {
-                            if (data.endsWith(BEGIN.slice(0, k))) { return k; }
-                        }
-                        return 0;
-                    })();
-                    if (longestPartialPrefix > 0) {
-                        const visible = data.slice(0, data.length - longestPartialPrefix);
-                        if (visible) { visibleOut += this.stripControlTokensWithBuffering(visible); }
-                        this._textToolParserBuffer = data.slice(data.length - longestPartialPrefix);
-                        data = "";
-                        break;
-                    } else {
-                        // All visible, clean other control tokens with buffering
-                        visibleOut += this.stripControlTokensWithBuffering(data);
-                        data = "";
-                        break;
-                    }
-                }
-                // Emit text before the token
-                const pre = data.slice(0, b);
-                if (pre) {
-                    visibleOut += this.stripControlTokensWithBuffering(pre);
-                }
-                // Advance past BEGIN
-                data = data.slice(b + BEGIN.length);
-
-                // Find the delimiter that ends the name/index segment
-                const a = data.indexOf(ARG_BEGIN);
-                const e = data.indexOf(END);
-                let delimIdx = -1;
-                let delimKind: "arg" | "end" | undefined = undefined;
-                if (a !== -1 && (e === -1 || a < e)) { delimIdx = a; delimKind = "arg"; }
-                else if (e !== -1) { delimIdx = e; delimKind = "end"; }
-                else {
-                    // Incomplete header; keep for next chunk (re-add BEGIN so we don't lose it)
-                    this._textToolParserBuffer = BEGIN + data;
-                    data = "";
-                    break;
-                }
-
-                const header = data.slice(0, delimIdx).trim();
-                const m = header.match(/^([A-Za-z0-9_\-.]+)(?::(\d+))?/);
-                const name = m?.[1] ?? undefined;
-                const index = m?.[2] ? Number(m?.[2]) : undefined;
-                this._textToolActive = { name, index, argBuffer: "", emitted: false };
-                // Advance past delimiter token
-                if (delimKind === "arg") {
-                    data = data.slice(delimIdx + ARG_BEGIN.length);
-                } else /* end */ {
-                    // No args, finalize immediately
-                    data = data.slice(delimIdx + END.length);
-                    const did = this.emitTextToolCallIfValid(progress, this._textToolActive, "{}");
-                    if (did) {
-                        this._textToolActive.emitted = true;
-                        emittedAny = true;
-                    }
-                    this._textToolActive = undefined;
-                }
-                continue;
-            }
-
-            // We are inside arguments, collect until END and emit as soon as JSON becomes valid
-            const e2 = data.indexOf(END);
-            if (e2 === -1) {
-                // No end marker yet, accumulate and check for early valid JSON
-                this._textToolActive.argBuffer += data;
-                // Early emit when JSON becomes valid and we haven't emitted yet
-                if (!this._textToolActive.emitted) {
-                    const did = this.emitTextToolCallIfValid(progress, this._textToolActive, this._textToolActive.argBuffer);
-                    if (did) {
-                        this._textToolActive.emitted = true;
-                        emittedAny = true;
-                    }
-                }
-                data = "";
-                break;
-            } else {
-                this._textToolActive.argBuffer += data.slice(0, e2);
-                // Consume END
-                data = data.slice(e2 + END.length);
-                // Final attempt to emit if not already
-                if (!this._textToolActive.emitted) {
-                    const did = this.emitTextToolCallIfValid(progress, this._textToolActive, this._textToolActive.argBuffer);
-                    if (did) {
-                        emittedAny = true;
-                    }
-                }
-                this._textToolActive = undefined;
-                continue;
-            }
-        }
-
-        // Emit any visible text
-        const textToEmit = visibleOut;
-        if (textToEmit && textToEmit.length > 0) {
-            progress.report(new vscode.LanguageModelTextPart(textToEmit));
-            emittedText = true;
-            emittedAny = true;
-        }
-
-        // Store leftover for next chunk
-        this._textToolParserBuffer = data;
-
-        return { emittedText, emittedAny };
-    }
-
-    private emitTextToolCallIfValid(
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        call: { name?: string; index?: number; argBuffer: string; emitted?: boolean },
-        argText: string,
-    ): boolean {
-        const name = call.name ?? "unknown_tool";
-        const parsed = tryParseJSONObject(argText);
-        if (!parsed.ok) {
-            return false;
-        }
-        const canonical = JSON.stringify(parsed.value);
-        const key = `${name}:${canonical}`;
-        // identity-based dedupe when index is present
-        if (typeof call.index === "number") {
-            const idKey = `${name}:${call.index}`;
-            if (this._emittedTextToolCallIds.has(idKey)) {
-                return false;
-            }
-            // Mark identity as emitted
-            this._emittedTextToolCallIds.add(idKey);
-        } else if (this._emittedTextToolCallKeys.has(key)) {
-            return false;
-        }
-        this._emittedTextToolCallKeys.add(key);
-        const id = `tct_${Math.random().toString(36).slice(2, 10)}`;
-        progress.report(new vscode.LanguageModelToolCallPart(id, name, parsed.value));
-        return true;
-    }
-
-    private async flushActiveTextToolCall(
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-    ): Promise<void> {
-        if (!this._textToolActive) {
-            return;
-        }
-        const argText = this._textToolActive.argBuffer;
-        const parsed = tryParseJSONObject(argText);
-        if (!parsed.ok) {
-            return;
-        }
-        // Emit (dedupe ensures we don't double-emit)
-        this.emitTextToolCallIfValid(progress, this._textToolActive, argText);
-        this._textToolActive = undefined;
-    }
-
-	/**
-	 * Try to emit a buffered tool call when a valid name and JSON arguments are available.
-	 * @param index The tool call index from the stream.
-	 * @param progress Progress reporter for parts.
-	 */
-    private async tryEmitBufferedToolCall(
-        index: number,
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>
-    ): Promise<void> {
-        const buf = this._toolCallBuffers.get(index);
-        if (!buf) {
-            return;
-        }
-        if (!buf.name) {
-            return;
-        }
-        const canParse = tryParseJSONObject(buf.args);
-        if (!canParse.ok) {
-            return;
-        }
-        const id = buf.id ?? `call_${Math.random().toString(36).slice(2, 10)}`;
-        const parameters = canParse.value;
-        try {
-            const canonical = JSON.stringify(parameters);
-            this._emittedTextToolCallKeys.add(`${buf.name}:${canonical}`);
-        } catch { /* ignore */ }
-        progress.report(new vscode.LanguageModelToolCallPart(id, buf.name, parameters));
-        this._toolCallBuffers.delete(index);
-        this._completedToolCallIndices.add(index);
-    }
-
-	/**
-	 * Flush all buffered tool calls, optionally throwing if arguments are not valid JSON.
-	 * @param progress Progress reporter for parts.
-	 * @param throwOnInvalid If true, throw when a tool call has invalid JSON args.
-	 */
-    private async flushToolCallBuffers(
-        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        throwOnInvalid: boolean,
-    ): Promise<void> {
-        if (this._toolCallBuffers.size === 0) {
-            return;
-        }
-        for (const [idx, buf] of Array.from(this._toolCallBuffers.entries())) {
-            const parsed = tryParseJSONObject(buf.args);
-            if (!parsed.ok) {
-                if (throwOnInvalid) {
-                    console.error("[Lemonade Model Provider] Invalid JSON for tool call", { idx, snippet: (buf.args || "").slice(0, 200) });
-                    throw new Error("Invalid JSON for tool call");
-                }
-                // When not throwing (e.g. on [DONE]), drop silently to reduce noise
-                continue;
-            }
-            const id = buf.id ?? `call_${Math.random().toString(36).slice(2, 10)}`;
-            const name = buf.name ?? "unknown_tool";
-            try {
-                const canonical = JSON.stringify(parsed.value);
-                this._emittedTextToolCallKeys.add(`${name}:${canonical}`);
-            } catch { /* ignore */ }
-            progress.report(new vscode.LanguageModelToolCallPart(id, name, parsed.value));
-            this._toolCallBuffers.delete(idx);
-            this._completedToolCallIndices.add(idx);
-        }
-    }
 
 	/** Strip provider control tokens like <|tool_calls_section_begin|> and <|tool_call_begin|> from streamed text. */
 	private stripControlTokens(text: string): string {
