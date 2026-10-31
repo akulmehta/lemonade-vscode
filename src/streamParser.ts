@@ -502,7 +502,9 @@ export class ChatStreamParser {
                 if (throwOnInvalid) {
                     throw new Error("Invalid JSON for tool call");
                 }
-                // When not throwing, drop cleanly so turn doesn't crash
+                // When not throwing, report error text to user so the incomplete turn is visible rather than silent
+                const toolName = buf.name || "tool";
+                progress.report(new vscode.LanguageModelTextPart(`\n\n[Warning: Tool call for '${toolName}' was truncated or contained invalid JSON. Output may have hit the maxOutputTokens limit.]\n`));
                 this._toolCallBuffers.delete(idx);
                 continue;
             }

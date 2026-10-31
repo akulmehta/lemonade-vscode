@@ -471,7 +471,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
             }
 
 			const configuredMaxOutput = resolveConfiguredMaxOutputTokens();
-			const maxOutputTokens = model.maxOutputTokens ?? configuredMaxOutput;
+			const maxOutputTokens = Math.max(model.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS, configuredMaxOutput);
 			const requestedTokens = options.modelOptions?.max_tokens;
             requestBody = {
                 model: realModelId,
