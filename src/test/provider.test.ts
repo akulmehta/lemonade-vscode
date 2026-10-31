@@ -284,12 +284,8 @@ suite("Lemonade Chat Provider Extension", () => {
 						if (url.endsWith("/models")) {
 							return { data: [{ id: "auto", object: "model", recipe_options: { ctx_size: -1 }, context_length: 262144 }] };
 						}
-						if (url.endsWith("/health")) {
-							return { all_models_loaded: [] };
-						}
-						if (url.endsWith("/models/auto/options")) {
-							return { resolved_ctx_size: 8192 };
-						}
+						if (url.endsWith("/health")) { return { all_models_loaded: [] }; }
+						if (url.endsWith("/models/auto/options")) { return { resolved_ctx_size: 8192 }; }
 						throw new Error(`Unexpected URL ${url}`);
 					},
 				});
