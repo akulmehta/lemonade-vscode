@@ -182,8 +182,8 @@ export class ChatStreamParser {
 
         const finish = (choice.finish_reason as string | undefined) ?? undefined;
         if (finish === "tool_calls" || finish === "stop") {
-            // On both 'tool_calls' and 'stop', emit any buffered calls and throw on invalid JSON
-            await this.flushToolCallBuffers(progress, /*throwOnInvalid*/ true);
+            // On both 'tool_calls' and 'stop', emit any buffered calls without crashing on truncated/partial JSON
+            await this.flushToolCallBuffers(progress, /*throwOnInvalid*/ false);
         }
         return emitted;
     }
@@ -493,11 +493,17 @@ export class ChatStreamParser {
         for (const [idx, buf] of Array.from(this._toolCallBuffers.entries())) {
             const parsed = tryParseJSONObject(buf.args);
             if (!parsed.ok) {
+                console.warn("[Lemonade Model Provider] Incomplete or invalid JSON for tool call", {
+                    idx,
+                    name: buf.name,
+                    argLength: (buf.args || "").length,
+                    snippet: (buf.args || "").slice(0, 200),
+                });
                 if (throwOnInvalid) {
-                    console.error("[Lemonade Model Provider] Invalid JSON for tool call", { idx, snippet: (buf.args || "").slice(0, 200) });
                     throw new Error("Invalid JSON for tool call");
                 }
-                // When not throwing (e.g. on [DONE]), drop silently to reduce noise
+                // When not throwing, drop cleanly so turn doesn't crash
+                this._toolCallBuffers.delete(idx);
                 continue;
             }
             const id = buf.id ?? `call_${Math.random().toString(36).slice(2, 10)}`;

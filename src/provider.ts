@@ -18,7 +18,42 @@ const DEFAULT_BASE_URL = "http://localhost:13305/api/v1";
 const DEFAULT_MAX_OUTPUT_TOKENS = 16000;
 const DEFAULT_CONTEXT_LENGTH = 128000;
 const DEFAULT_API_KEY = "lemonade";
+const DEFAULT_REQUEST_TIMEOUT = 300000;
 const ENDPOINTS_SECRET_KEY = "lemonade.endpoints";
+
+/**
+ * Resolve the max output tokens to use. Reads from VS Code setting
+ * `lemonade.maxOutputTokens`; falls back to DEFAULT_MAX_OUTPUT_TOKENS when
+ * the setting is absent, not a positive integer, or when running outside VS Code.
+ */
+export function resolveConfiguredMaxOutputTokens(): number {
+	try {
+		const config = vscode.workspace.getConfiguration("lemonade");
+		const raw = config.get<number>("maxOutputTokens");
+		if (raw !== undefined && Number.isFinite(raw) && raw > 0) {
+			return raw;
+		}
+	} catch {
+		// Running outside VS Code (e.g., tests) — fall through to default
+	}
+	return DEFAULT_MAX_OUTPUT_TOKENS;
+}
+
+/**
+ * Resolve the maximum time allowed for an HTTP request in milliseconds.
+ * Reads from VS Code setting `lemonade.requestTimeout`; falls back to DEFAULT_REQUEST_TIMEOUT.
+ */
+export function resolveRequestTimeout(): number {
+	try {
+		const raw = vscode.workspace.getConfiguration("lemonade").get<number>("requestTimeout");
+		if (raw !== undefined && Number.isFinite(raw) && raw > 0) {
+			return raw;
+		}
+	} catch {
+		// Running outside VS Code (e.g., tests) — fall through to default
+	}
+	return DEFAULT_REQUEST_TIMEOUT;
+}
 
 const REASONING_LEVEL_LABELS: Record<string, string> = {
 	none: "None",
@@ -435,7 +470,8 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
                 throw new Error("Message exceeds token limit.");
             }
 
-			const maxOutputTokens = model.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+			const configuredMaxOutput = resolveConfiguredMaxOutputTokens();
+			const maxOutputTokens = model.maxOutputTokens ?? configuredMaxOutput;
 			const requestedTokens = options.modelOptions?.max_tokens;
             requestBody = {
                 model: realModelId,
@@ -478,29 +514,46 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			if (token.isCancellationRequested) {
 				return;
 			}
-			const response = await fetch(`${baseUrl}/chat/completions`, {
-                method: "POST",
-                headers: {
-                    Authorization: `Bearer ${apiKey}`,
-                    "Content-Type": "application/json",
-					"User-Agent": this.userAgent,
-                },
-                body: JSON.stringify(requestBody),
-				signal: abortController.signal,
-            });
 
-			if (!response.ok) {
-				const errorText = await response.text();
-				console.error("[Lemonade Model Provider] API error response", errorText);
-				throw new Error(
-					`Lemonade API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
-				);
-			}
+			const requestTimeout = resolveRequestTimeout();
+			let timeoutHit = false;
+			const timeoutId = setTimeout(() => {
+				timeoutHit = true;
+				abortController.abort();
+			}, requestTimeout);
 
-			if (!response.body) {
-				throw new Error("No response body from Lemonade API");
+			try {
+				const response = await fetch(`${baseUrl}/chat/completions`, {
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${apiKey}`,
+						"Content-Type": "application/json",
+						"User-Agent": this.userAgent,
+					},
+					body: JSON.stringify(requestBody),
+					signal: abortController.signal,
+				});
+
+				if (!response.ok) {
+					const errorText = await response.text();
+					console.error("[Lemonade Model Provider] API error response", errorText);
+					throw new Error(
+						`Lemonade API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
+					);
+				}
+
+				if (!response.body) {
+					throw new Error("No response body from Lemonade API");
+				}
+				await new ChatStreamParser().processStreamingResponse(response.body, trackingProgress, token);
+			} catch (fetchErr) {
+				if (timeoutHit) {
+					throw new Error(`[Lemonade] Request timed out after ${requestTimeout}ms. You can increase this with the lemonade.requestTimeout setting.`);
+				}
+				throw fetchErr;
+			} finally {
+				clearTimeout(timeoutId);
 			}
-			await new ChatStreamParser().processStreamingResponse(response.body, trackingProgress, token);
 		} catch (err) {
 			if (token.isCancellationRequested && abortController.signal.aborted) {
 				return;

@@ -88,28 +88,13 @@
 						"items": { "type": "string" }
 					},
 					"markdownDescription": "Reasoning effort levels shown in the model picker. Keys are case-insensitive substrings of the model id (e.g. `\"gpt-oss\": [\"low\", \"medium\", \"high\"]`); `\"*\"` applies to all models labelled `reasoning`. An empty array hides the picker for matching models."
-				}
-			}
-		},
-		"commands": [
-			{
-				"command": "lemonade.manage",
-				"title": "Manage Lemonade Provider"
-			},
-			{
-				"command": "lemonade.toggleEphemeralFilter",
-				"title": "Toggle Lemonade filter ephemeral data"
-			}
-		],
-		"configuration": {
-			"title": "Lemonade",
-			"properties": {
+				},
 				"lemonade.maxOutputTokens": {
 					"type": "integer",
 					"default": 65536,
 					"minimum": 1,
 					"maximum": 262144,
-					"description": "Maximum response tokens requested from Lemonade."
+					"description": "Maximum response tokens advertised to VS Code and requested from Lemonade."
 				},
 				"lemonade.requestTimeout": {
 					"type": "integer",
@@ -132,7 +117,17 @@
 					"description": "List of model IDs or substring names to explicitly enable vision/image support for."
 				}
 			}
-		}
+		},
+		"commands": [
+			{
+				"command": "lemonade.manage",
+				"title": "Manage Lemonade Provider"
+			},
+			{
+				"command": "lemonade.toggleEphemeralFilter",
+				"title": "Toggle Lemonade filter ephemeral data"
+			}
+		]
 	},
 	"main": "./out/extension.js",
 	"scripts": {
