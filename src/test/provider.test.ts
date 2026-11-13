@@ -306,7 +306,7 @@ suite("Lemonade Chat Provider Extension", () => {
 			}
 		});
 
-		test("provideLanguageModelChatResponse reports reasoning_content as thinking", async function () {
+		test("provideLanguageModelChatResponse keeps thinking IDs stable across deltas", async function () {
 			const ThinkingPart = (vscode as unknown as Record<string, unknown>)["LanguageModelThinkingPart"] as
 				| (new (...args: unknown[]) => object)
 				| undefined;
@@ -321,8 +321,11 @@ suite("Lemonade Chat Provider Extension", () => {
 					ok: true,
 					body: new ReadableStream<Uint8Array>({
 						start(controller) {
-							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"pondering\"}}]}\n\n"));
+							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"reasoning_content\":{\"text\":\"pondering\",\"id\":\"chunk-1\"}}}]}\n\n"));
+							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"reasoning_content\":{\"text\":\"\",\"id\":\"empty-marker\"}}}]}\n\n"));
+							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"reasoning_content\":{\"text\":\" more\",\"id\":\"chunk-2\"}}}]}\n\n"));
 							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n"));
+							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"reasoning_content\":{\"text\":\"later\",\"id\":\"chunk-3\"}}}]}\n\n"));
 							controller.enqueue(encoder.encode("data: [DONE]\n\n"));
 							controller.close();
 						},
@@ -353,12 +356,181 @@ suite("Lemonade Chat Provider Extension", () => {
 					new vscode.CancellationTokenSource().token
 				);
 
-				assert.ok(parts[0] instanceof ThinkingPart!, "reasoning_content should be reported as a thinking part");
-				assert.ok(parts[1] instanceof vscode.LanguageModelTextPart);
-				assert.equal((parts[1] as vscode.LanguageModelTextPart).value, "answer");
+				const thinkingParts = parts.filter((part) => part instanceof ThinkingPart!) as Array<Record<string, unknown>>;
+				assert.equal(thinkingParts.length, 3);
+				assert.deepEqual(thinkingParts.map((part) => part["id"]), ["chunk-1", "chunk-1", "chunk-3"]);
+				assert.deepEqual(thinkingParts.map((part) => part["value"]), ["pondering", " more", "later"]);
+				const answer = parts.find((part) => part instanceof vscode.LanguageModelTextPart) as vscode.LanguageModelTextPart | undefined;
+				assert.ok(answer);
+				assert.equal(answer.value, "answer");
 			} finally {
 				(global as unknown as Record<string, unknown>).fetch = originalFetch;
 			}
+		});
+
+		test("provideLanguageModelChatResponse assigns stable IDs to string reasoning deltas", async function () {
+			const ThinkingPart = (vscode as unknown as Record<string, unknown>)["LanguageModelThinkingPart"] as
+				| (new (...args: unknown[]) => object)
+				| undefined;
+			if (!ThinkingPart) {
+				this.skip();
+			}
+
+			const originalFetch = global.fetch;
+			try {
+				const encoder = new TextEncoder();
+				(global as unknown as Record<string, unknown>).fetch = async () => ({
+					ok: true,
+					body: new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"pondering\"}}]}\n\n"));
+							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" more\"}}]}\n\n"));
+							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n"));
+							controller.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"later\"}}]}\n\n"));
+							controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+							controller.close();
+						},
+					}),
+				});
+
+				const provider = new LemonadeChatModelProvider({
+					get: async () => undefined,
+					store: async () => {},
+					delete: async () => {},
+					onDidChange: (_listener: unknown) => ({ dispose() {} }),
+				} as unknown as vscode.SecretStorage, "test/test");
+
+				const runRequest = async (): Promise<unknown[]> => {
+					const parts: unknown[] = [];
+					await provider.provideLanguageModelChatResponse(
+						{
+							id: "m",
+							name: "m",
+							family: "lemonade",
+							version: "1.0.0",
+							maxInputTokens: 1000,
+							maxOutputTokens: 1000,
+							capabilities: {},
+						} as unknown as vscode.LanguageModelChatInformation,
+						[{ role: vscode.LanguageModelChatMessageRole.User, content: [new vscode.LanguageModelTextPart("hi")], name: undefined }],
+						{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+						{ report: (part) => parts.push(part) },
+						new vscode.CancellationTokenSource().token
+					);
+					return parts.filter((part) => part instanceof ThinkingPart!);
+				};
+
+				const thinkingParts = await runRequest() as Array<Record<string, unknown>>;
+				assert.equal(thinkingParts.length, 3);
+				const [first, second, third] = thinkingParts.map((part) => part["id"]);
+				assert.ok(typeof first === "string" && first.length > 0);
+				assert.equal(second, first);
+				assert.notEqual(third, first);
+
+				// IDs must not repeat across requests (e.g. agent-mode tool-call rounds within one turn).
+				const nextRequestParts = await runRequest() as Array<Record<string, unknown>>;
+				assert.notEqual(nextRequestParts[0]["id"], first);
+				assert.notEqual(nextRequestParts[0]["id"], third);
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		});
+	});
+
+	suite("stats and usage report", () => {
+		/**
+		 * Run one chat request against a mocked stream serving the given SSE
+		 * payloads; returns the reported parts and the parsed chat request body.
+		 */
+		async function runUsageRequest(ssePayloads: string[]): Promise<{ parts: unknown[]; body: Record<string, unknown> }> {
+			const originalFetch = global.fetch;
+			const bodies: string[] = [];
+			try {
+				const encoder = new TextEncoder();
+				(global as unknown as Record<string, unknown>).fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+					bodies.push(String(init?.body));
+					return {
+						ok: true,
+						body: new ReadableStream<Uint8Array>({
+							start(controller) {
+								for (const payload of ssePayloads) {
+									controller.enqueue(encoder.encode(payload));
+								}
+								controller.close();
+							},
+						}),
+						text: async () => "",
+					};
+				};
+
+				const provider = new LemonadeChatModelProvider({
+					get: async () => undefined,
+					store: async () => {},
+					delete: async () => {},
+					onDidChange: (_listener: unknown) => ({ dispose() {} }),
+				} as unknown as vscode.SecretStorage, "test/test");
+
+				const parts: unknown[] = [];
+				await provider.provideLanguageModelChatResponse(
+					{
+						id: "m",
+						name: "m",
+						family: "lemonade",
+						version: "1.0.0",
+						maxInputTokens: 1000,
+						maxOutputTokens: 1000,
+						capabilities: {},
+					} as unknown as vscode.LanguageModelChatInformation,
+					[{ role: vscode.LanguageModelChatMessageRole.User, content: [new vscode.LanguageModelTextPart("usage")], name: undefined }],
+					{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+					{ report: (p) => parts.push(p) },
+					new vscode.CancellationTokenSource().token
+				);
+				return { parts, body: JSON.parse(bodies[0]) as Record<string, unknown> };
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		}
+
+		test("sends stream_options include_usage and reports a usage data part", async () => {
+			const DataPart = (vscode as unknown as Record<string, unknown>)["LanguageModelDataPart"] as
+				| (new (...args: unknown[]) => { data: Uint8Array; mimeType: string })
+				| undefined;
+			if (!DataPart) { return; } // older VS Code runtimes have no data parts
+
+			const { parts, body } = await runUsageRequest([
+				"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+				"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n",
+				"data: [DONE]\n\n",
+			]);
+
+			// The request body must ask for usage in the stream.
+			assert.deepEqual(body["stream_options"], { include_usage: true }, "must send stream_options.include_usage");
+
+			// A usage data part must be reported with the token counts.
+			const usagePart = parts.find((p) => p instanceof DataPart! && (p as InstanceType<typeof DataPart>).mimeType === "usage") as InstanceType<typeof DataPart> | undefined;
+			assert.ok(usagePart, "expected a usage data part");
+			assert.deepEqual(JSON.parse(new TextDecoder().decode(usagePart!.data)), {
+				prompt_tokens: 10,
+				completion_tokens: 5,
+				total_tokens: 15,
+			});
+		});
+
+		test("does not report a usage part when the server returns no token counts", async () => {
+			const DataPart = (vscode as unknown as Record<string, unknown>)["LanguageModelDataPart"] as
+				| (new (...args: unknown[]) => { mimeType: string })
+				| undefined;
+			if (!DataPart) { return; }
+
+			const { parts } = await runUsageRequest([
+				"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+				"data: {\"choices\":[],\"usage\":{}}\n\n",
+				"data: [DONE]\n\n",
+			]);
+
+			const usagePart = parts.find((p) => p instanceof DataPart! && (p as InstanceType<typeof DataPart>).mimeType === "usage");
+			assert.ok(!usagePart, "no usage part expected when counts are empty");
 		});
 	});
 

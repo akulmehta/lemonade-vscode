@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import * as vscode from "vscode";
 import { tryParseJSONObject } from "./utils";
 
@@ -36,6 +37,15 @@ export class ChatStreamParser {
 
 	/** Buffer for handling control tokens that might be split across streaming chunks. */
 	private _controlTokenBuffer = "";
+    private _thinkingSequenceId: string | undefined;
+    private _thinkingSequenceActive = false;
+
+	/**
+	 * Token usage captured from the stream (typically the final chunk before
+	 * [DONE], which carries `usage` and empty choices). Empty when the server
+	 * did not report usage.
+	 */
+	readonly usage: Record<string, unknown> = {};
 
 	/**
 	 * Read and parse the Lemonade server streaming (SSE-like) response and report parts.
@@ -98,6 +108,12 @@ export class ChatStreamParser {
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     ): Promise<boolean> {
         let emitted = false;
+        // Extract usage data from the response chunk (typically in the last chunk
+        // before [DONE], which carries `usage` with an empty `choices` array).
+        const usage = (delta.usage as Record<string, unknown> | undefined);
+        if (usage && typeof usage === "object") {
+            Object.assign(this.usage, usage);
+        }
         const choice = (delta.choices as Record<string, unknown>[] | undefined)?.[0];
         if (!choice) { return false; }
 
@@ -127,7 +143,11 @@ export class ChatStreamParser {
                             text = maybeThinking;
                         }
                         if (text) {
-                            progress.report(new (ThinkingCtor as new (text: string, id?: string, metadata?: unknown) => unknown)(text, id, metadata) as unknown as vscode.LanguageModelResponsePart);
+                            if (!this._thinkingSequenceActive) {
+                                this._thinkingSequenceId = id || `lemonade-thinking-${randomUUID()}`;
+                                this._thinkingSequenceActive = true;
+                            }
+                            progress.report(new (ThinkingCtor as new (text: string, id?: string, metadata?: unknown) => unknown)(text, this._thinkingSequenceId, metadata) as unknown as vscode.LanguageModelResponsePart);
                             emitted = true;
                         }
                     }
@@ -137,6 +157,7 @@ export class ChatStreamParser {
             }
             if (deltaObj?.content) {
                 const content = String(deltaObj.content);
+                this.resetThinkingSequence();
                 const res = this.processTextContent(content, progress);
                 if (res.emittedText) {
                     this._hasEmittedAssistantText = true;
@@ -148,6 +169,9 @@ export class ChatStreamParser {
 
 			if (deltaObj?.tool_calls) {
                 const toolCalls = deltaObj.tool_calls as Array<Record<string, unknown>>;
+                if (toolCalls.length > 0) {
+                    this.resetThinkingSequence();
+                }
 
 				// SSEProcessor-like: if first tool call appears after text, emit a whitespace
 				// to ensure any UI buffers/linkifiers are flushed without adding visible noise.
@@ -186,6 +210,11 @@ export class ChatStreamParser {
             await this.flushToolCallBuffers(progress, /*throwOnInvalid*/ false);
         }
         return emitted;
+    }
+
+    private resetThinkingSequence(): void {
+        this._thinkingSequenceId = undefined;
+        this._thinkingSequenceActive = false;
     }
 
 	/**
